@@ -1,0 +1,440 @@
+# src/strategy.py
+import pandas as pd
+import numpy as np
+from typing import Optional, Dict
+
+# ============================
+# Indicadores auxiliares
+# ============================
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def true_range(df: pd.DataFrame) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    return tr
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    return true_range(df).ewm(span=period, adjust=False).mean()
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=series.index).ewm(span=period, adjust=False).mean()
+    roll_down = pd.Series(down, index=series.index).ewm(span=period, adjust=False).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    r = 100.0 - (100.0 / (1.0 + rs))
+    return r.fillna(50.0)
+
+def _pos(x):
+    return x.where(x > 0, 0.0)
+
+def _neg(x):
+    return (-x).where(x < 0, 0.0)
+
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    ADX clássico (Wilder) suavizado com EMA para estabilidade em 5m.
+    Retorna série do ADX; use adx.iloc[-1] para o último valor.
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = _pos(up_move.where(up_move > down_move, 0.0))
+    minus_dm = _pos(down_move.where(down_move > up_move, 0.0))
+
+    tr = true_range(df)
+    atr_ = tr.ewm(span=period, adjust=False).mean()
+
+    plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / atr_.replace(0, np.nan))
+    minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr_.replace(0, np.nan))
+
+    dx = ( (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) ) * 100
+    adx = dx.ewm(span=period, adjust=False).mean().fillna(0.0)
+    return adx
+
+def vwap(df: pd.DataFrame) -> pd.Series:
+    """
+    VWAP cumulativo no período do dataframe.
+    (Para 5m, funciona bem; se quiser AVWAP ancorado, podemos adicionar.)
+    """
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
+    cum_pv = (typical_price * df["volume"]).cumsum()
+    cum_vol = (df["volume"]).cumsum().replace(0, np.nan)
+    return (cum_pv / cum_vol).fillna(method="backfill")
+
+# ============================
+# Estratégia
+# ============================
+
+class Strategy:
+    """
+    signal_mode:
+      - "atr_breakout_vwap" (default)
+      - "ema_rsi_atr"       (compatibilidade com modo antigo)
+    """
+
+    def __init__(self, cfg: dict = None, logger=None):
+        self.cfg = cfg or {}
+        self.log = logger
+        tcfg = self.cfg.get("trade", {}) or {}
+
+        # modo
+        self.signal_mode = str(tcfg.get("signal_mode", "atr_breakout_vwap")).lower()
+
+        # parâmetros comuns
+        self.timeframe = tcfg.get("timeframe", "5m")
+        self.min_atr_pct = float(tcfg.get("min_atr_pct", 0.008))  # 0.8% recomendado no 5m
+        self.atr_mult_sl = float(tcfg.get("atr_mult_sl", 1.0))
+        self.atr_mult_tp = float(tcfg.get("atr_mult_tp", 1.6))
+
+        # ATR fallback (para feeds com atr≈0; normalmente não precisa no 5m)
+        self.atr_zero_fallback_pct = float(tcfg.get("atr_zero_fallback_pct", 0.0))
+
+        # filtros de regime
+        self.adx_min = float(tcfg.get("adx_min", 18))
+        # >>> NOVO: alinhamento flexível por config <<<
+        #   - entry_alignment: "none" | "quarter" | "custom"  (se ausente, cai no legado align_to_quarter_hour)
+        #   - entry_minutes: [lista de minutos] (se entry_alignment="custom")
+        self.entry_alignment = str(tcfg.get("entry_alignment", "")).lower().strip()
+        self.entry_minutes = tcfg.get("entry_minutes", None)
+        # legada (retrocompat): True -> restringe a 0/15/30/45
+        self.align_to_quarter_hour = bool(tcfg.get("align_to_quarter_hour", True))
+
+        self.signal_confirm_bars = int(tcfg.get("signal_confirm_bars", 1))
+        self.vwap_slope_window = int(tcfg.get("vwap_slope_window", 8))
+
+        # canal ATR (breakout)
+        self.n_channel = int(tcfg.get("n_channel", 30))
+        self.k_atr = float(tcfg.get("k_atr", 0.75))
+
+        # compat (modo antigo)
+        self.rsi_short_min = float(tcfg.get("rsi_short_min", 30))
+        self.rsi_long_max  = float(tcfg.get("rsi_long_max", 70))
+
+    # ---------- helpers ----------
+
+    def _time_allows_entry(self, df: pd.DataFrame) -> bool:
+        """
+        Regras de alinhamento de tempo:
+          - Se trade.entry_alignment existir:
+              "none"    -> sempre True
+              "quarter" -> somente minutos 0/15/30/45
+              "custom"  -> somente minutos listados em trade.entry_minutes
+          - Caso contrário, usa o legado align_to_quarter_hour (bool).
+        """
+        tcfg = self.cfg.get("trade", {}) or {}
+        alignment = self.entry_alignment  # já normalizado no __init__
+
+        # 1) Nova chave (preferida)
+        if alignment:
+            if alignment == "none":
+                return True
+            try:
+                ts = pd.to_datetime(df["timestamp"].iloc[-1])
+                minute = int(ts.minute)
+            except Exception:
+                return True
+
+            if alignment == "quarter":
+                return (minute % 15) == 0
+            if alignment == "custom":
+                allowed = tcfg.get("entry_minutes", self.entry_minutes) or []
+                try:
+                    allowed = [int(x) for x in allowed]
+                except Exception:
+                    allowed = []
+                return minute in set(allowed)
+            # alinhamento desconhecido -> sem restrição
+            return True
+
+        # 2) Retrocompatibilidade
+        if not getattr(self, "align_to_quarter_hour", False):
+            return True
+        try:
+            ts = pd.to_datetime(df["timestamp"].iloc[-1])
+            minute = int(ts.minute)
+            return (minute % 15) == 0
+        except Exception:
+            return True
+
+    def _compute_common_features(self, df: pd.DataFrame) -> Dict:
+        df = df.copy()
+        for col in ("open", "high", "low", "close", "volume"):
+            df[col] = df[col].astype(float)
+
+        close = df["close"]
+        e20 = ema(close, 20)
+        e50 = ema(close, 50)
+        a14 = atr(df, 14)
+        adx14 = adx(df, 14)
+        v = vwap(df)
+
+        last_price = float(close.iloc[-1])
+        last_e20 = float(e20.iloc[-1])
+        last_e50 = float(e50.iloc[-1])
+        last_atr = float(a14.iloc[-1])
+        last_adx = float(adx14.iloc[-1])
+        last_vwap = float(v.iloc[-1])
+
+        # atr% e fallback
+        atr_pct = (last_atr / last_price) if last_price > 0 else 0.0
+        atr_eff = last_atr
+        atr_fallback_used = False
+        if (atr_pct <= 0 or not np.isfinite(atr_pct)) and self.atr_zero_fallback_pct > 0:
+            atr_eff = last_price * self.atr_zero_fallback_pct
+            atr_pct = self.atr_zero_fallback_pct
+            atr_fallback_used = True
+
+        # tendência por EMAs
+        trend = "long" if last_e20 > last_e50 else ("short" if last_e20 < last_e50 else "flat")
+
+        # slope da VWAP (última vs N barras atrás)
+        slope_sign = 0
+        if len(v) > self.vwap_slope_window:
+            try:
+                prev = float(v.iloc[-self.vwap_slope_window])
+                if last_vwap > prev: slope_sign = 1
+                elif last_vwap < prev: slope_sign = -1
+                else: slope_sign = 0
+            except Exception:
+                slope_sign = 0
+
+        # canal ATR (Donchian + k*ATR)
+        N = min(self.n_channel, len(df))
+        if N < 5:
+            ch_top = ch_bottom = None
+        else:
+            hh = float(df["high"].rolling(N).max().iloc[-1])
+            ll = float(df["low"].rolling(N).min().iloc[-1])
+            ch_top = hh + self.k_atr * last_atr
+            ch_bottom = ll - self.k_atr * last_atr
+
+        return {
+            "price": last_price,
+            "ema20": last_e20,
+            "ema50": last_e50,
+            "atr": last_atr,
+            "atr_pct": atr_pct,
+            "atr_eff": atr_eff,
+            "atr_fallback_used": atr_fallback_used,
+            "adx": last_adx,
+            "trend": trend,
+            "vwap": last_vwap,
+            "vwap_slope_sign": slope_sign,  # 1 up, -1 down, 0 flat
+            "ch_top": ch_top,
+            "ch_bottom": ch_bottom,
+        }
+
+    # ---------- modo novo: atr_breakout_vwap ----------
+
+    def _signal_atr_breakout_vwap(self, df: pd.DataFrame) -> Optional[Dict]:
+        if df is None or len(df) < max(50, self.n_channel + 5):
+            return None
+
+        if not self._time_allows_entry(df):
+            # respeitar janelas se configurado
+            return None
+
+        f = self._compute_common_features(df)
+        price = f["price"]
+
+        # filtro volatilidade
+        if f["atr_pct"] < self.min_atr_pct:
+            return None
+
+        # filtro de regime: ADX e EMAs
+        if f["adx"] < self.adx_min or f["trend"] == "flat":
+            return None
+
+        # confirmação por VWAP
+        if f["trend"] == "long":
+            if not (price > f["vwap"] and f["vwap_slope_sign"] >= 0):
+                return None
+            # breakout
+            if f["ch_top"] is None or not (price > f["ch_top"]):
+                return None
+            # confirmação por barras (condições mantidas nas últimas 'signal_confirm_bars')
+            if self.signal_confirm_bars > 1:
+                if not self._confirm_last_bars(df, mode="long"):
+                    return None
+            entry = price
+            stop = entry - self.atr_mult_sl * f["atr_eff"]
+            tp = entry + self.atr_mult_tp * f["atr_eff"]
+            return {"signal": "long", "entry": entry, "stop": stop, "tp": tp,
+                    "info": {"atr": f["atr"], "ch_top": f["ch_top"], "vwap": f["vwap"], "adx": f["adx"]}}
+
+        else:  # trend == "short"
+            if not (price < f["vwap"] and f["vwap_slope_sign"] <= 0):
+                return None
+            if f["ch_bottom"] is None or not (price < f["ch_bottom"]):
+                return None
+            if self.signal_confirm_bars > 1:
+                if not self._confirm_last_bars(df, mode="short"):
+                    return None
+            entry = price
+            stop = entry + self.atr_mult_sl * f["atr_eff"]
+            tp = entry - self.atr_mult_tp * f["atr_eff"]
+            return {"signal": "short", "entry": entry, "stop": stop, "tp": tp,
+                    "info": {"atr": f["atr"], "ch_bottom": f["ch_bottom"], "vwap": f["vwap"], "adx": f["adx"]}}
+
+    def _confirm_last_bars(self, df: pd.DataFrame, mode: str) -> bool:
+        """
+        Confirmação simples: nas últimas 'signal_confirm_bars' barras,
+        manter:
+          - EMAs alinhadas e ADX >= adx_min
+          - preço do lado correto da VWAP com slope coerente
+        """
+        k = self.signal_confirm_bars
+        if k <= 1:
+            return True
+        sub = df.iloc[-k:].copy()
+        e20 = ema(sub["close"].astype(float), 20)
+        e50 = ema(sub["close"].astype(float), 50)
+        a14 = atr(sub, 14)
+        ax = adx(sub, 14)
+        v = vwap(sub)
+
+        try:
+            slope_sign = 0
+            if len(v) > 1:
+                slope_sign = 1 if float(v.iloc[-1]) > float(v.iloc[0]) else (-1 if float(v.iloc[-1]) < float(v.iloc[0]) else 0)
+            price_ok = False
+            if mode == "long":
+                price_ok = (float(sub["close"].iloc[-1]) > float(v.iloc[-1])) and (slope_sign >= 0)
+                emas_ok = float(e20.iloc[-1]) > float(e50.iloc[-1])
+            else:
+                price_ok = (float(sub["close"].iloc[-1]) < float(v.iloc[-1])) and (slope_sign <= 0)
+                emas_ok = float(e20.iloc[-1]) < float(e50.iloc[-1])
+            adx_ok = float(ax.iloc[-1]) >= self.adx_min
+            # também garante ATR > 0
+            atr_ok = float(a14.iloc[-1]) > 0
+            return bool(price_ok and emas_ok and adx_ok and atr_ok)
+        except Exception:
+            return False
+
+    # ---------- modo antigo (compat) ----------
+
+    def _signal_ema_rsi_atr(self, df: pd.DataFrame) -> Optional[Dict]:
+        if df is None or len(df) < 50:
+            return None
+        close = df["close"].astype(float)
+        e9 = ema(close, 9)
+        e21 = ema(close, 21)
+        r = rsi(close, 14)
+        a = atr(df, 14)
+        price = float(close.iloc[-1])
+        last_e9 = float(e9.iloc[-1])
+        last_e21 = float(e21.iloc[-1])
+        last_rsi = float(r.iloc[-1])
+        last_atr = float(a.iloc[-1])
+
+        atr_pct = (last_atr / price) if price > 0 else 0.0
+        atr_eff = last_atr
+        if atr_pct <= 0 and self.atr_zero_fallback_pct > 0:
+            atr_eff = price * self.atr_zero_fallback_pct
+            atr_pct = self.atr_zero_fallback_pct
+
+        if atr_pct < self.min_atr_pct:
+            return None
+
+        if last_e9 > last_e21 and last_rsi <= self.rsi_long_max:
+            entry = price
+            stop = entry - self.atr_mult_sl * atr_eff
+            tp = entry + self.atr_mult_tp * atr_eff
+            return {"signal": "long", "entry": entry, "stop": stop, "tp": tp, "info": {"atr": last_atr}}
+
+        if last_e9 < last_e21 and last_rsi >= (100.0 - self.rsi_short_min):
+            entry = price
+            stop = entry + self.atr_mult_sl * atr_eff
+            tp = entry - self.atr_mult_tp * atr_eff
+            return {"signal": "short", "entry": entry, "stop": stop, "tp": tp, "info": {"atr": last_atr}}
+
+        return None
+
+    # ---------- API pública ----------
+
+    def generate_signal(self, df: pd.DataFrame) -> Optional[Dict]:
+        mode = self.signal_mode
+        if mode == "atr_breakout_vwap":
+            return self._signal_atr_breakout_vwap(df)
+        # fallback para modo antigo
+        return self._signal_ema_rsi_atr(df)
+
+    def explain_signal(self, df: pd.DataFrame) -> Dict:
+        """
+        Retorna diagnóstico amigável para o debug_scan:
+        {signal, reason, atr, atr_pct, adx, trend, vwap, ch_top/ch_bottom, entry, stop}
+        """
+        out = {
+            "signal": None, "reason": "", "atr": 0.0, "atr_pct": 0.0, "adx": 0.0,
+            "trend": "flat", "vwap": 0.0, "entry": None, "stop": None,
+            "atr_fallback_used": False, "vwap_slope_sign": 0
+        }
+        try:
+            f = self._compute_common_features(df)
+        except Exception:
+            out["reason"] = "insufficient_candles" if (df is None or len(df) < 20) else "calc_error"
+            return out
+
+        out.update({
+            "atr": f["atr"], "atr_pct": f["atr_pct"], "adx": f["adx"],
+            "trend": f["trend"], "vwap": f["vwap"], "vwap_slope_sign": f["vwap_slope_sign"],
+        })
+
+        if self.signal_mode != "atr_breakout_vwap":
+            # explicar compat antiga
+            sig = self._signal_ema_rsi_atr(df)
+            if sig:
+                out.update({"signal": sig["signal"], "entry": sig["entry"], "stop": sig["stop"], "reason": "ok"})
+            else:
+                out["reason"] = "no_signal"
+            return out
+
+        # explica o modo novo
+        if not self._time_allows_entry(df):
+            out["reason"] = "time_not_aligned"
+            return out
+        if f["atr_pct"] < self.min_atr_pct:
+            out["reason"] = "atr_low"
+            return out
+        if f["adx"] < self.adx_min or f["trend"] == "flat":
+            out["reason"] = "regime_filter"
+            return out
+
+        price = f["price"]
+        if f["trend"] == "long":
+            if not (price > f["vwap"] and f["vwap_slope_sign"] >= 0):
+                out["reason"] = "vwap_confirm_fail"
+                return out
+            if f["ch_top"] is None or not (price > f["ch_top"]):
+                out["reason"] = "no_breakout"
+                return out
+            if self.signal_confirm_bars > 1 and not self._confirm_last_bars(df, mode="long"):
+                out["reason"] = "confirm_bars_fail"
+                return out
+            entry = price
+            stop = entry - self.atr_mult_sl * f["atr_eff"]
+            out.update({"signal": "long", "entry": entry, "stop": stop, "reason": "ok"})
+            return out
+        else:
+            if not (price < f["vwap"] and f["vwap_slope_sign"] <= 0):
+                out["reason"] = "vwap_confirm_fail"
+                return out
+            if f["ch_bottom"] is None or not (price < f["ch_bottom"]):
+                out["reason"] = "no_breakout"
+                return out
+            if self.signal_confirm_bars > 1 and not self._confirm_last_bars(df, mode="short"):
+                out["reason"] = "confirm_bars_fail"
+                return out
+            entry = price
+            stop = entry + self.atr_mult_sl * f["atr_eff"]
+            out.update({"signal": "short", "entry": entry, "stop": stop, "reason": "ok"})
+            return out
