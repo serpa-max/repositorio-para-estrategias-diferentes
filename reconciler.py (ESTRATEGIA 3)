@@ -1,0 +1,163 @@
+# src/reconciler.py
+import asyncio
+from typing import Dict, Any
+from .strategy import atr
+from .utils import price_to_precision
+
+class Reconciler:
+    """
+    Responsável por:
+      - Trailing stop (modo: 'atr_highwater'): 
+          * LONG: SL = highwater - (trailing_atr_mult * ATR)
+          * SHORT: SL = lowwater  + (trailing_atr_mult * ATR)
+      - Break-even após TP1: ao tocar tp1, move SL -> entry.
+      - Recriar SL de segurança caso inexista.
+    Depende de:
+      ex  = Exchange
+      cfg = config
+      state['open_positions_info'][sym] -> {qty, entry, side, stop, tp_targets, be_done?, hw?, lw?}
+    """
+
+    def __init__(self, exchange, strategy, risk_manager, logger, cfg: Dict[str, Any], state: Dict[str, Any], on_position_closed=None):
+        self.ex = exchange
+        self.strategy = strategy
+        self.risk = risk_manager
+        self.log = logger
+        self.cfg = cfg
+        self.state = state
+        self.on_closed = on_position_closed
+
+        tcfg = cfg.get("trade", {}) or {}
+        self.timeframe = tcfg.get("timeframe", "5m")
+        self.trailing_atr_mult = float(tcfg.get("trailing_atr_mult", 2.3))
+        self.trailing_update_seconds = int(tcfg.get("trailing_update_seconds", 20))
+
+    async def run(self):
+        while True:
+            try:
+                await self._tick()
+            except Exception as e:
+                self.log.exception(f"Reconciler tick error: {e}")
+            await asyncio.sleep(self.trailing_update_seconds)
+
+    async def _tick(self):
+        positions = await asyncio.to_thread(self.ex.fetch_positions_map)  # {symbol: {side,size,entryPrice}}
+        open_syms = set()
+        for sym, p in positions.items():
+            size = float(p.get("size") or 0.0)
+            if size <= 0:
+                continue
+            side = str(p.get("side") or "").lower() or ("long" if size > 0 else "short")
+            entry = float(p.get("entryPrice") or 0.0)
+            if entry <= 0:
+                continue
+            open_syms.add(sym)
+
+            # garante infos no state
+            st = self.state.setdefault("open_positions_info", {}).setdefault(sym, {
+                "qty": size, "entry": entry, "side": side, "stop": None, "tp_targets": []
+            })
+            st["qty"] = float(st.get("qty") or size)
+            st["entry"] = float(st.get("entry") or entry)
+            st["side"] = side
+
+            # 1) recriar SL se não houver
+            oos = await asyncio.to_thread(self.ex.fetch_open_orders_by_symbol, sym)
+            has_sl = any(("stop" in (o.get("type","").lower())) or ("stopPrice" in (o.get("info") or {})) for o in oos)
+            if not has_sl:
+                # cria SL 1x ATR de segurança
+                candles = await asyncio.to_thread(self.ex.get_ohlcv, sym, self.timeframe, 120)
+                if candles is not None and len(candles) > 20:
+                    a = float(atr(candles, 14).iloc[-1])
+                    if a > 0:
+                        sl_guess = (entry - a) if side == "long" else (entry + a)
+                        sl_guess = price_to_precision(self.ex.exchange, sym, sl_guess)
+                        try:
+                            self.ex._create_stop_market(sym, "sell" if side=="long" else "buy", size, sl_guess)
+                            self.log.info(f"[Reconciler] SL (segurança) recriado {sym} @ {sl_guess}")
+                        except Exception:
+                            self.log.warning(f"[Reconciler] Falha recriar SL {sym}")
+
+            # 2) Break-even após TP1
+            try:
+                tp_targets = st.get("tp_targets") or []
+                if tp_targets and not st.get("be_done"):
+                    last = await asyncio.to_thread(self.ex.get_last_price, sym)
+                    if not last:
+                        last = entry
+                    tp1 = float(tp_targets[0])
+                    hit = (last >= tp1) if side == "long" else (last <= tp1)
+                    if hit:
+                        be_price = entry  # BE exato (sem offset)
+                        be_price = price_to_precision(self.ex.exchange, sym, be_price)
+                        try:
+                            await asyncio.to_thread(
+                                self.ex.update_trailing_if_needed,
+                                sym, side, last, be_price, None  # força substituir SL -> BE
+                            )
+                            st["be_done"] = True
+                            st["stop"] = be_price
+                            self.log.info(f"[{sym}] BE ativado após TP1 @ {be_price}")
+                        except Exception as e:
+                            self.log.warning(f"[{sym}] falha mover SL->BE: {e}")
+            except Exception:
+                pass
+
+            # 3) Trailing ATR por high/low water
+            try:
+                candles = await asyncio.to_thread(self.ex.get_ohlcv, sym, self.timeframe, 120)
+                if candles is None or len(candles) < 20:
+                    continue
+                a = float(atr(candles, 14).iloc[-1])
+                if a <= 0:
+                    continue
+                last_high = float(candles["high"].iloc[-1])
+                last_low = float(candles["low"].iloc[-1])
+
+                if side == "long":
+                    # atualiza high-water
+                    hw = st.get("hw")
+                    hw = max(hw, last_high) if hw is not None else max(last_high, entry)
+                    st["hw"] = hw
+                    new_sl = hw - self.trailing_atr_mult * a
+                else:
+                    lw = st.get("lw")
+                    lw = min(lw, last_low) if lw is not None else min(last_low, entry)
+                    st["lw"] = lw
+                    new_sl = lw + self.trailing_atr_mult * a
+
+                new_sl = price_to_precision(self.ex.exchange, sym, new_sl)
+                last_price = float(candles["close"].iloc[-1])
+
+                await asyncio.to_thread(
+                    self.ex.update_trailing_if_needed,
+                    sym, side, last_price, new_sl, None
+                )
+                st["stop"] = float(new_sl)
+            except Exception as e:
+                self.log.warning(f"[{sym}] update_trailing_if_needed erro: {e}")
+
+        # detectar fechamentos para limpar estado
+        previously_open = set(self.state.get("open_symbols", set()))
+        closed_now = previously_open - open_syms
+        for sym in closed_now:
+            # estimativa de PnL aproximado (fallback)
+            pos_info = self.state.get("open_positions_info", {}).get(sym, {})
+            qty = float(pos_info.get("qty") or 0.0)
+            side = pos_info.get("side")
+            entry = float(pos_info.get("entry") or 0.0)
+            last = await asyncio.to_thread(self.ex.get_last_price, sym) or entry
+            pnl = 0.0
+            if qty > 0 and entry > 0:
+                if side == "long":
+                    pnl = (last - entry) * qty
+                else:
+                    pnl = (entry - last) * qty
+            if callable(self.on_closed):
+                try:
+                    reason = "closed_detected"
+                    self.on_closed(sym, pnl, reason)
+                except Exception:
+                    pass
+
+        self.state["open_symbols"] = set(open_syms)
