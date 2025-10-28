@@ -1,0 +1,100 @@
+# src/risk_manager.py
+from typing import Tuple, List, Dict
+from .utils import round_qty_for_exchange
+
+class RiskManager:
+    """
+    - Sizing: continua por risco% do equity e distância (|entry - stop|).
+    - TP Plan (novo para esta estratégia):
+        * TP1 em 2R com 50% da posição.
+        * Restante fica para o trailing (feito no Reconciler).
+    Parâmetros lidos de trade:
+        - risk_per_trade (float %)
+        - max_notional_pct (float)
+        - tp1_r_mult (float, default 2.0)
+        - tp1_qty_pct (float, default 50.0)  # compat
+    """
+
+    def __init__(self, config: dict = None, logger=None):
+        cfg = config.get("trade", {}) if config else {}
+        self.risk_pct = float(cfg.get("risk_per_trade", 1.0))
+        self.max_notional_pct = float(cfg.get("max_notional_pct", 0.10))
+        self.leverage = config.get("exchange", {}).get("leverage", 1) if config else 1
+        self.logger = logger
+
+        # partials / TP1 em R
+        self.tp1_r_mult = float(cfg.get("tp1_r_mult", 2.0))
+        self.tp1_qty_pct = float(cfg.get("tp1_qty_pct", 50.0))
+
+    def set_risk_pct(self, pct: float):
+        try:
+            self.risk_pct = float(pct)
+        except Exception:
+            pass
+
+    def calculate_position(self, exchange_obj, symbol: str, signal: dict, current_equity: float = None) -> Tuple[float, float, float]:
+        entry = float(signal.get("entry", 0.0))
+        stop = float(signal.get("stop", 0.0))
+        tp = float(signal.get("tp", 0.0)) if signal.get("tp") else 0.0
+
+        equity = current_equity if current_equity is not None else 0.0
+        if current_equity is None:
+            try:
+                if hasattr(exchange_obj, "get_balance"):
+                    equity = float(exchange_obj.get_balance() or 0.0)
+            except Exception:
+                if self.logger:
+                    self.logger.exception("risk_manager: erro obtendo equity")
+                equity = 0.0
+
+        if equity <= 0:
+            if self.logger:
+                self.logger.warning("risk_manager: equity <= 0")
+            return 0.0, stop, tp
+
+        denom = abs(entry - stop)
+        if denom <= 0:
+            if self.logger:
+                self.logger.warning("risk_manager: entry-stop <= 0")
+            return 0.0, stop, tp
+
+        risk_money = equity * (self.risk_pct / 100.0)
+        raw_qty = (risk_money / denom) * float(self.leverage)
+
+        max_notion = equity * float(self.max_notional_pct) * float(self.leverage)
+        qty_cap = max_notion / entry if entry > 0 else raw_qty
+        qty = min(raw_qty, qty_cap)
+
+        qty = round_qty_for_exchange(exchange_obj.exchange, symbol, qty)
+        if qty <= 0:
+            if self.logger:
+                self.logger.warning("risk_manager: qty arredondada <= 0")
+            return 0.0, stop, tp
+
+        return qty, stop, tp
+
+    def build_tp_plan(self, side: str, entry: float, atr: float, qty: float, stop: float = None) -> List[Dict]:
+        """
+        Para a estratégia SQUEEZE:
+          - calcula R = |entry-stop|
+          - TP1 = entry ± 2R com qty parcial (default 50%)
+          - restante gerido pelo trailing (não retorna TP2 para evitar conflito)
+        """
+        if stop is None or entry is None:
+            return []
+        R = abs(entry - float(stop))
+        if R <= 0:
+            return []
+        tp1 = entry + self.tp1_r_mult * R if side == "long" else entry - self.tp1_r_mult * R
+        tp1_qty = max(0.0, min(100.0, self.tp1_qty_pct)) / 100.0 * qty
+        if tp1_qty <= 0:
+            return []
+        return [{"price": float(tp1), "qty": float(tp1_qty)}]
+
+    # usado no debug_scan
+    def diagnose_position(self, exchange_obj, symbol: str, fake_signal: dict, current_equity: float = None) -> Dict:
+        entry = float(fake_signal.get("entry", 0.0) or 0.0)
+        stop = float(fake_signal.get("stop", 0.0) or 0.0)
+        qty, _, _ = self.calculate_position(exchange_obj, symbol, {"entry": entry, "stop": stop}, current_equity=current_equity)
+        reason = "ok" if qty > 0 else ("entry_stop_invalid" if (entry <= 0 or stop <= 0 or entry == stop) else "qty_zero")
+        return {"qty": qty, "reason": reason}
