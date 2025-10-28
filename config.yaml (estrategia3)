@@ -1,0 +1,73 @@
+exchange:
+  name: bybit
+  testnet: true              # true = Testnet | false = conta real
+  paper: true                # true = paper (sem ordens reais)
+  leverage: 3
+  margin_mode: CROSS
+
+# ====== SUAS CREDENCIAIS (substitua) ======
+api_key: "<SUA_API_KEY_BYBIT>"
+api_secret: "<SUA_API_SECRET_BYBIT>"
+
+trade:
+  # ===== Timeframe & Pares =====
+  timeframe: "5m"
+  pairs:
+    - "BTC/USDT:USDT"
+    - "ETH/USDT:USDT"
+  # (depois de validar, pode adicionar mais pares)
+
+  # ===== Estratégia (SQUEEZE + DONCHIAN + TENDÊNCIA) =====
+  signal_mode: "squeeze_donchian_trend"
+
+  # Tendência
+  ema_fast: 50
+  ema_slow: 200
+
+  # Squeeze (Bandas de Bollinger)
+  bb_period: 20
+  bb_stds: 2.0
+  squeeze_lookback: 180
+  squeeze_percentile: 20        # largura <= percentil 20% => squeeze ativo
+
+  # Rompimento
+  donchian_n: 30
+
+  # Impulso
+  adx_min: 18
+  impulse_body_atr_mult: 0.4    # corpo >= 0.4xATR pode substituir ADX
+
+  # Stops/Metas
+  stop_atr_mult: 0.9            # SL inicial = 0.9xATR
+  tp1_r_mult: 2.0               # TP1 = 2R (parcial)
+  tp1_qty_pct: 50.0             # realiza 50% no TP1
+
+  # Trailing (gerido pelo reconciler)
+  trailing_atr_mult: 2.3
+  trailing_update_seconds: 20
+
+  # ===== Risco/Proteções =====
+  risk_per_trade: 5.0           # você pediu 5% (alto p/ real; ok p/ testes)
+  max_notional_pct: 0.30        # teto de exposição bruta (evita “capar” o risco)
+  daily_loss_limit_pct: 10      # circuito diário (teste)
+  max_open_positions: 3
+  max_trades_per_day: 999
+  max_consecutive_losses: 999
+  runtime_persist_seconds: 30
+
+telegram:
+  token: "<SEU_TELEGRAM_BOT_TOKEN>"
+  chat_id: "<SEU_CHAT_ID>"
+  status_interval_minutes: 5
+
+report:
+  daily_report_utc: "23:59"
+
+market_data:
+  source: "live"                 # usa OHLCV público; execução continua na sua conta/testnet
+
+debug:
+  enabled: true
+  scan_report_minutes: 5
+  pairs_limit: 8
+  send_only_when_no_trades: false
