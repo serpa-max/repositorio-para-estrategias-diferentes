@@ -1,0 +1,369 @@
+# src/strategy.py
+import pandas as pd
+import numpy as np
+from typing import Optional, Dict
+
+# ============================
+# Indicadores auxiliares
+# ============================
+
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+def true_range(df: pd.DataFrame) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    return tr
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    return true_range(df).ewm(span=period, adjust=False).mean()
+
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    tr = true_range(df)
+    atr_ = tr.ewm(span=period, adjust=False).mean().replace(0, np.nan)
+
+    plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / atr_)
+    minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr_)
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
+    return dx.ewm(span=period, adjust=False).mean().fillna(0.0)
+
+def bollinger(series: pd.Series, period: int = 20, stds: float = 2.0):
+    ma = series.rolling(period).mean()
+    sd = series.rolling(period).std(ddof=0)
+    upper = ma + stds * sd
+    lower = ma - stds * sd
+    width = (upper - lower)
+    return ma, upper, lower, width
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    s = series.astype(float)
+    delta = s.diff()
+    up = (delta.where(delta > 0, 0.0)).ewm(alpha=1/period, adjust=False).mean()
+    down = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = up / down.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50.0)
+
+# ============================
+# Estratégia
+# ============================
+
+class Strategy:
+    """
+    Modes suportados:
+      - "squeeze_donchian_trend" (novo — esta estratégia)
+      - "atr_breakout_vwap"      (stub p/ compat)
+      - "ema_rsi_atr"            (stub p/ compat)
+    """
+
+    def __init__(self, cfg: dict = None, logger=None):
+        self.cfg = cfg or {}
+        self.log = logger
+        tcfg = self.cfg.get("trade", {}) or {}
+
+        # modo
+        self.signal_mode = str(tcfg.get("signal_mode", "squeeze_donchian_trend")).lower()
+
+        # -------- parâmetros SQUEEZE+DONCHIAN+TENDÊNCIA --------
+        self.tf = tcfg.get("timeframe", "5m")
+        self.ema_fast = int(tcfg.get("ema_fast", 50))
+        self.ema_slow = int(tcfg.get("ema_slow", 200))
+
+        self.bb_period = int(tcfg.get("bb_period", 20))
+        self.bb_stds = float(tcfg.get("bb_stds", 2.0))
+        self.squeeze_lookback = int(tcfg.get("squeeze_lookback", 180))
+        self.squeeze_percentile = float(tcfg.get("squeeze_percentile", 20.0))  # %
+        self.donchian_n = int(tcfg.get("donchian_n", 30))
+        self.adx_min = float(tcfg.get("adx_min", 18.0))
+        self.impulse_body_atr_mult = float(tcfg.get("impulse_body_atr_mult", 0.4))
+
+        # stop e metas expressos em ATR/R
+        self.stop_atr_mult = float(tcfg.get("stop_atr_mult", 0.9))  # stop inicial = 0.9*ATR
+        self.tp1_r_mult = float(tcfg.get("tp1_r_mult", 2.0))       # TP1 = 2R (parcial 50%)
+
+        # -------- parâmetros genéricos/legado (mantidos p/ compatibilidade) --------
+        self.entry_alignment = str(tcfg.get("entry_alignment", "")).lower().strip()
+        self.entry_minutes = tcfg.get("entry_minutes", None)
+        self.align_to_quarter_hour = bool(tcfg.get("align_to_quarter_hour", False))
+
+        # para outros modos (stubs/compat)
+        self.min_atr_pct = float(tcfg.get("min_atr_pct", 0.008))
+        self.atr_zero_fallback_pct = float(tcfg.get("atr_zero_fallback_pct", 0.0))
+        self.signal_confirm_bars = int(tcfg.get("signal_confirm_bars", 1))
+        self.vwap_slope_window = int(tcfg.get("vwap_slope_window", 8))
+        self.n_channel = int(tcfg.get("n_channel", 30))
+        self.k_atr = float(tcfg.get("k_atr", 0.75))
+
+    # ---------- helpers de tempo (retrocompat/alinhamento opcional) ----------
+    def _time_allows_entry(self, df: pd.DataFrame) -> bool:
+        tcfg = self.cfg.get("trade", {}) or {}
+        alignment = self.entry_alignment
+        if alignment:
+            if alignment == "none":
+                return True
+            try:
+                ts = pd.to_datetime(df["timestamp"].iloc[-1])
+                minute = int(ts.minute)
+            except Exception:
+                return True
+            if alignment == "quarter":
+                return (minute % 15) == 0
+            if alignment == "custom":
+                allowed = tcfg.get("entry_minutes", self.entry_minutes) or []
+                try:
+                    allowed = [int(x) for x in allowed]
+                except Exception:
+                    allowed = []
+                return minute in set(allowed)
+            return True
+        if not getattr(self, "align_to_quarter_hour", False):
+            return True
+        try:
+            ts = pd.to_datetime(df["timestamp"].iloc[-1])
+            minute = int(ts.minute)
+            return (minute % 15) == 0
+        except Exception:
+            return True
+
+    # ---------- SQUEEZE + DONCHIAN + TENDÊNCIA ----------
+    def _signal_squeeze_donchian_trend(self, df: pd.DataFrame) -> Optional[Dict]:
+        if df is None or len(df) < max(200, self.squeeze_lookback + 30, self.donchian_n + 5):
+            return None
+        if not self._time_allows_entry(df):
+            return None
+
+        o = df["open"].astype(float)
+        h = df["high"].astype(float)
+        l = df["low"].astype(float)
+        c = df["close"].astype(float)
+
+        e_fast = ema(c, self.ema_fast)
+        e_slow = ema(c, self.ema_slow)
+        a14 = atr(df, 14)
+        ax = adx(df, 14)
+
+        bb_ma, bb_up, bb_lo, bb_w = bollinger(c, self.bb_period, self.bb_stds)
+        widths = bb_w.tail(self.squeeze_lookback).dropna()
+        if len(widths) < max(30, self.squeeze_lookback // 2):
+            return None
+        try:
+            pctl = np.nanpercentile(widths.values, self.squeeze_percentile)
+        except Exception:
+            pctl = widths.quantile(self.squeeze_percentile / 100.0)
+
+        # Donchian
+        don_high = df["high"].rolling(self.donchian_n).max()
+        don_low = df["low"].rolling(self.donchian_n).min()
+
+        price = float(c.iloc[-1])
+        open_ = float(o.iloc[-1])
+        e_fast_last = float(e_fast.iloc[-1])
+        e_slow_last = float(e_slow.iloc[-1])
+        atr_last = float(a14.iloc[-1])
+        adx_last = float(ax.iloc[-1])
+        bb_up_last = float(bb_up.iloc[-1])
+        bb_lo_last = float(bb_lo.iloc[-1])
+        bb_w_last = float(bb_w.iloc[-1])
+        don_high_last = float(don_high.iloc[-1])
+        don_low_last = float(don_low.iloc[-1])
+
+        if atr_last <= 0 or not np.isfinite(atr_last):
+            return None
+
+        # bias de tendência (para debug/telemetria)
+        if (price > e_slow_last) and (e_fast_last > e_slow_last):
+            trend_bias = "long"
+        elif (price < e_slow_last) and (e_fast_last < e_slow_last):
+            trend_bias = "short"
+        else:
+            trend_bias = "neutral"
+
+        # squeeze ativo?
+        squeeze_on = (bb_w_last <= pctl)
+
+        # corpo do candle (impulso alternativo ao ADX)
+        body = abs(price - open_)
+        impulse_ok = (adx_last >= self.adx_min) or (body >= self.impulse_body_atr_mult * atr_last)
+
+        # ------- LONG -------
+        if (trend_bias == "long") and squeeze_on and impulse_ok:
+            # rompimento confirmado: fecha acima de donchian_high e acima da banda superior
+            if (price > don_high_last) and (price > bb_up_last):
+                entry = price
+                stop = entry - self.stop_atr_mult * atr_last
+                r = abs(entry - stop)
+                tp1 = entry + self.tp1_r_mult * r
+                return {
+                    "signal": "long",
+                    "entry": entry,
+                    "stop": stop,
+                    "tp": tp1,  # TP1 (parcial); o restante sai por trailing
+                    "info": {
+                        "atr": atr_last, "adx": adx_last,
+                        "squeeze_pctl": float(pctl), "squeeze_w": bb_w_last,
+                        "don_high": don_high_last, "don_low": don_low_last,
+                        "bb_up": bb_up_last, "bb_lo": bb_lo_last,
+                        "r": r, "bias": trend_bias,
+                        "atr_pct": (atr_last / price) if price > 0 else 0.0
+                    }
+                }
+
+        # ------- SHORT -------
+        if (trend_bias == "short") and squeeze_on and impulse_ok:
+            if (price < don_low_last) and (price < bb_lo_last):
+                entry = price
+                stop = entry + self.stop_atr_mult * atr_last
+                r = abs(entry - stop)
+                tp1 = entry - self.tp1_r_mult * r
+                return {
+                    "signal": "short",
+                    "entry": entry,
+                    "stop": stop,
+                    "tp": tp1,
+                    "info": {
+                        "atr": atr_last, "adx": adx_last,
+                        "squeeze_pctl": float(pctl), "squeeze_w": bb_w_last,
+                        "don_high": don_high_last, "don_low": don_low_last,
+                        "bb_up": bb_up_last, "bb_lo": bb_lo_last,
+                        "r": r, "bias": trend_bias,
+                        "atr_pct": (atr_last / price) if price > 0 else 0.0
+                    }
+                }
+
+        return None
+
+    # ---------- outros modos já existentes (stubs p/ compat) ----------
+    def _signal_atr_breakout_vwap(self, df: pd.DataFrame) -> Optional[Dict]:
+        return None
+
+    def _signal_ema_rsi_atr(self, df: pd.DataFrame) -> Optional[Dict]:
+        return None
+
+    # ---------- API pública ----------
+
+    def generate_signal(self, df: pd.DataFrame) -> Optional[Dict]:
+        mode = self.signal_mode
+        if mode == "squeeze_donchian_trend":
+            return self._signal_squeeze_donchian_trend(df)
+        if mode == "atr_breakout_vwap":
+            return self._signal_atr_breakout_vwap(df)
+        if mode == "ema_rsi_atr":
+            return self._signal_ema_rsi_atr(df)
+        return self._signal_squeeze_donchian_trend(df)
+
+    def explain_signal(self, df: pd.DataFrame) -> Dict:
+        """
+        Retorna sempre chaves de compatibilidade esperadas pelo debug:
+          signal, reason, entry, stop, atr, adx, squeeze_w, squeeze_pctl,
+          don_high, don_low, bias, atr_pct, rsi
+        """
+        out = {
+            "signal": None, "reason": "", "entry": None, "stop": None,
+            "atr": 0.0, "adx": 0.0, "squeeze_w": 0.0, "squeeze_pctl": 0.0,
+            "don_high": None, "don_low": None,
+            "bias": "neutral", "atr_pct": 0.0, "rsi": 50.0,
+        }
+        try:
+            c = df["close"].astype(float)
+            o = df["open"].astype(float)
+            e_fast_s = ema(c, self.ema_fast)
+            e_slow_s = ema(c, self.ema_slow)
+            a14_s = atr(df, 14)
+            ax_s = adx(df, 14)
+            _, bb_up_s, bb_lo_s, bb_w_s = bollinger(c, self.bb_period, self.bb_stds)
+            Dhi_s = df["high"].rolling(self.donchian_n).max()
+            Dlo_s = df["low"].rolling(self.donchian_n).min()
+            rsi_s = rsi(c, 14)
+
+            price = float(c.iloc[-1])
+            open_ = float(o.iloc[-1])
+            e_fast = float(e_fast_s.iloc[-1])
+            e_slow = float(e_slow_s.iloc[-1])
+            a14 = float(a14_s.iloc[-1])
+            ax = float(ax_s.iloc[-1])
+            bb_up = float(bb_up_s.iloc[-1])
+            bb_lo = float(bb_lo_s.iloc[-1])
+            bb_w = float(bb_w_s.iloc[-1])
+            Dhi = float(Dhi_s.iloc[-1])
+            Dlo = float(Dlo_s.iloc[-1])
+            rsi_last = float(rsi_s.iloc[-1])
+
+            out.update({
+                "atr": a14, "adx": ax, "squeeze_w": bb_w, "don_high": Dhi, "don_low": Dlo,
+                "atr_pct": (a14 / price) if price > 0 else 0.0,
+                "rsi": rsi_last
+            })
+
+            # bias
+            if (price > e_slow) and (e_fast > e_slow):
+                bias = "long"
+            elif (price < e_slow) and (e_fast < e_slow):
+                bias = "short"
+            else:
+                bias = "neutral"
+            out["bias"] = bias
+
+            # tenta sinal (para preencher entry/stop)
+            sig = self._signal_squeeze_donchian_trend(df) if self.signal_mode == "squeeze_donchian_trend" else None
+            if sig:
+                out.update({
+                    "signal": sig["signal"],
+                    "entry": float(sig["entry"]),
+                    "stop": float(sig["stop"]),
+                    "reason": "ok",
+                })
+                # já temos demais infos em sig["info"], mas mantemos out consistente
+                return out
+
+            # Sem sinal: descreve motivo de bloqueio
+            # regras na ordem de bloqueio
+            if bias == "neutral":
+                out["reason"] = "trend_misaligned"
+                return out
+
+            # squeeze percentil
+            widths = bb_w_s.tail(self.squeeze_lookback).dropna()
+            try:
+                pctl = np.nanpercentile(widths.values, self.squeeze_percentile) if len(widths) > 10 else bb_w
+            except Exception:
+                pctl = widths.quantile(self.squeeze_percentile / 100.0) if len(widths) > 10 else bb_w
+            out["squeeze_pctl"] = float(pctl)
+
+            squeeze_on = (bb_w <= pctl)
+            if not squeeze_on:
+                out["reason"] = "no_squeeze"
+                return out
+
+            # rompimento
+            if bias == "long":
+                if not (price > Dhi and price > bb_up):
+                    out["reason"] = "no_breakout_long"
+                    return out
+            if bias == "short":
+                if not (price < Dlo and price < bb_lo):
+                    out["reason"] = "no_breakout_short"
+                    return out
+
+            # impulso
+            body = abs(price - open_)
+            if not (ax >= self.adx_min or body >= self.impulse_body_atr_mult * a14):
+                out["reason"] = "no_impulse"
+                return out
+
+            out["reason"] = "ok"
+            return out
+
+        except Exception:
+            out["reason"] = "calc_error"
+            return out
