@@ -1,1 +1,638 @@
+import asyncio
+import yaml
+import os
+import json
+from datetime import datetime, date, timezone, time as dtime
+from typing import Dict, Any
+
+from src.exchange import Exchange
+from src.strategy import Strategy
+from src.telegram_bot import TelegramBot
+from src.risk_manager import RiskManager
+from src.logger import Logger
+from src.reconciler import Reconciler
+
+PERSIST_JSON = "bot_trades_persist.json"
+TRADES_CSV = os.path.join("data", "trades.csv")
+RUNTIME_JSON = "runtime_state.json"
+CONTROLS_DIR = "controls"  # canal de comandos vindo do dashboard
+
+_state = {
+    "day": None,
+    "equity_start": None,
+    "circuit_paused": False,
+    "last_equity": 0.0,
+    "open_symbols": set(),
+    "open_positions_info": {},   # {symbol: {"qty":..., "entry":..., "side":..., "stop":..., "tp_targets": [...], "be_done":bool, "hw":float, "lw":float}}
+    "daily": {"trades": 0, "wins": 0, "losses": 0, "consecutive_losses": 0, "realized_pnl": 0.0},
+}
+
+
+# ----------------- util/persistência -----------------
+
+def load_config() -> Dict[str, Any]:
+    with open("config/config.yaml", "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+def save_trade_to_json(rec: Dict[str, Any]):
+    try:
+        if os.path.exists(PERSIST_JSON):
+            with open(PERSIST_JSON, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = {}
+        key = f"{rec.get('symbol','UNK')}-{datetime.utcnow().isoformat()}"
+        data[key] = rec
+        with open(PERSIST_JSON, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print("Erro salvando JSON:", e)
+
+def append_trade_csv(rec: Dict[str, Any]):
+    try:
+        os.makedirs("data", exist_ok=True)
+        header = not os.path.exists(TRADES_CSV)
+        with open(TRADES_CSV, "a", encoding="utf-8") as f:
+            if header:
+                f.write("ts,symbol,side,qty,entry,stop,tp,order_id,status\n")
+            f.write("{ts},{symbol},{side},{qty},{entry},{stop},{tp},{order_id},{status}\n".format(
+                ts=datetime.utcnow().isoformat(),
+                symbol=rec.get("symbol",""),
+                side=rec.get("side",""),
+                qty=rec.get("qty",""),
+                entry=rec.get("entry",""),
+                stop=rec.get("stop",""),
+                tp=rec.get("tp",""),
+                order_id=rec.get("order_id",""),
+                status=rec.get("status",""),
+            ))
+    except Exception as e:
+        print("Erro salvando CSV:", e)
+
+def save_runtime_state():
+    try:
+        from datetime import date as _date, datetime as _dt
+        with open(RUNTIME_JSON, "w", encoding="utf-8") as f:
+            day_val = _state.get("day")
+            if isinstance(day_val, (_date, _dt)):
+                day_val = day_val.isoformat()
+            json_state = {
+                **_state,
+                "day": day_val,
+                "open_symbols": sorted(list(_state.get("open_symbols", set()))),
+                "open_positions_info": _state.get("open_positions_info", {}),
+            }
+            json.dump(json_state, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+def load_runtime_state_from_disk():
+    if not os.path.exists(RUNTIME_JSON):
+        return
+    try:
+        with open(RUNTIME_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        stored_daily = data.get("daily") or {}
+        default_daily = {"trades": 0,"wins": 0,"losses": 0,"consecutive_losses": 0,"realized_pnl": 0.0}
+        default_daily.update(stored_daily)
+        from datetime import date as _date
+        day_raw = data.get("day")
+        try:
+            day_norm = _date.fromisoformat(day_raw) if isinstance(day_raw, str) else None
+        except Exception:
+            day_norm = None
+        _state.update({
+            "day": day_norm,
+            "equity_start": data.get("equity_start"),
+            "circuit_paused": bool(data.get("circuit_paused", False)),
+            "last_equity": float(data.get("last_equity", 0.0) or 0.0),
+            "daily": default_daily,
+        })
+        _state["open_symbols"] = set(data.get("open_symbols", []) or [])
+        stored_positions = data.get("open_positions_info", {}) or {}
+        normalized_positions = {}
+        for sym, info in stored_positions.items():
+            qty = info.get("qty"); entry = info.get("entry"); stop = info.get("stop")
+            normalized_positions[sym] = {
+                "qty": float(qty) if qty is not None else None,
+                "entry": float(entry) if entry is not None else None,
+                "side": (info.get("side") or "").lower(),
+                "stop": float(stop) if stop else None,
+                "tp_targets": [float(t) for t in info.get("tp_targets", []) if t],
+                "be_done": bool(info.get("be_done", False)),
+                "hw": info.get("hw"),
+                "lw": info.get("lw"),
+            }
+        _state["open_positions_info"] = normalized_positions
+    except Exception:
+        _state["open_symbols"] = set()
+        _state["open_positions_info"] = {}
+
+def rehydrate_runtime_state(exchange: Exchange, logger: Logger):
+    try:
+        positions = exchange.fetch_positions_map()
+    except Exception as exc:
+        logger.warning(f"Falha ao reidratar posições: {exc}")
+        return
+    live_symbols = set()
+    for sym, info in positions.items():
+        size = abs(float(info.get("size") or 0.0))
+        if size <= 0: continue
+        side = str(info.get("side") or ("long" if info.get("size", 0) > 0 else "short")).lower()
+        entry = float(info.get("entryPrice") or 0.0)
+        live_symbols.add(sym)
+        stored = _state["open_positions_info"].get(sym, {})
+        _state["open_positions_info"][sym] = {
+            "qty": float(stored.get("qty", size) or size),
+            "entry": float(stored.get("entry", entry) or entry),
+            "side": (stored.get("side") or side or "").lower(),
+            "stop": float(stored.get("stop")) if stored.get("stop") else None,
+            "tp_targets": [float(t) for t in (stored.get("tp_targets") or []) if t],
+            "be_done": bool(stored.get("be_done", False)),
+            "hw": stored.get("hw"),
+            "lw": stored.get("lw"),
+        }
+    for sym in list(_state.get("open_positions_info", {}).keys()):
+        if sym not in live_symbols:
+            _state["open_positions_info"].pop(sym, None)
+    _state["open_symbols"] = live_symbols
+    save_runtime_state()
+
+def validate_config(cfg: Dict[str, Any], logger: Logger):
+    trade = cfg.get("trade", {})
+    risk_pct = float(trade.get("risk_per_trade", 1.0) or 0.0)
+    if risk_pct <= 0:
+        logger.warning("risk_per_trade <= 0 detectado. Ajustando para 1%.")
+        trade["risk_per_trade"] = 1.0
+    elif risk_pct > 2.0:
+        # manter estilo que funcionou no seu logger (sem placeholders adicionais)
+        logger.warning(f"risk_per_trade={risk_pct}% é alto para produção. (Sugerido <=2%.) Mantendo valor a pedido do usuário.")
+    max_notional = float(trade.get("max_notional_pct", 0.10) or 0.0)
+    if max_notional <= 0 or max_notional > 1:
+        logger.warning("max_notional_pct inválido. Normalizando para 0.10 (10%).")
+        trade["max_notional_pct"] = 0.10
+    cfg["trade"] = trade
+
+
+# ----------------- proteções/limites -----------------
+
+def _reset_day(equity_now: float):
+    _state["day"] = date.today()
+    _state["equity_start"] = equity_now
+    _state["circuit_paused"] = False
+    _state["daily"] = {"trades":0,"wins":0,"losses":0,"consecutive_losses":0,"realized_pnl":0.0}
+
+def in_no_trade_window(cfg_trade: dict) -> bool:
+    windows = cfg_trade.get("no_trade_hours", [])
+    if not windows: return False
+    now = datetime.now(timezone.utc).time()
+    for w in windows:
+        try:
+            a, b = w.split("-"); h1, m1 = map(int, a.split(":")); h2, m2 = map(int, b.split(":"))
+            if dtime(h1, m1) <= now <= dtime(h2, m2): return True
+        except Exception:
+            continue
+    return False
+
+def _check_circuit_breaker(equity_now: float, limit_pct: float) -> bool:
+    if _state["day"] != date.today() or _state["equity_start"] is None:
+        _reset_day(equity_now); return False
+    if _state["equity_start"] <= 0: return False
+    dd = (equity_now - _state["equity_start"]) / _state["equity_start"] * 100.0
+    _state["last_equity"] = equity_now
+    if dd <= -abs(limit_pct): _state["circuit_paused"] = True
+    return _state["circuit_paused"]
+
+
+# ----------------- loops auxiliares -----------------
+
+async def runtime_persist_loop(interval_sec: int):
+    while True:
+        try: save_runtime_state()
+        except Exception: pass
+        await asyncio.sleep(max(5, int(interval_sec)))
+
+async def daily_report_loop(telegram, exchange, cfg):
+    hh, mm = map(int, cfg.get("report", {}).get("daily_report_utc", "23:59").split(":"))
+    while True:
+        now = datetime.now(timezone.utc)
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if target <= now:
+            from datetime import timedelta
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        equity = await asyncio.to_thread(exchange.get_balance)
+        start = _state.get("equity_start") or 0.0
+        dd_pct = 0.0 if start in (None, 0) else (equity - start)/start*100.0
+        d = _state["daily"]
+        msg = (
+            f"🧾 <b>Relatório diário</b>\n"
+            f"Equity inicial: {start:.2f} USDT\n"
+            f"Equity atual: {equity:.2f} USDT\n"
+            f"Δ dia: {dd_pct:.2f}%\n\n"
+            f"Trades: {d['trades']} | Wins: {d['wins']} | Losses: {d['losses']} | Seq. perdas: {d['consecutive_losses']}\n"
+            f"PnL realizado (aprox): {d['realized_pnl']:.2f} USDT\n"
+            f"Circuito: {'PAUSADO' if _state['circuit_paused'] else 'ATIVO'}"
+        )
+        try: await telegram.send_message(msg)
+        except Exception: pass
+
+async def status_heartbeat_loop(telegram: TelegramBot, exchange: Exchange, strategy: Strategy, cfg: Dict[str, Any], logger: Logger):
+    """
+    Heartbeat rico: equity, dd dia, posições e saúde do bot.
+    Frequência: telegram.status_interval_minutes
+    """
+    interval_min = int(cfg.get("telegram", {}).get("status_interval_minutes", 5))
+    timeframe = cfg.get("trade", {}).get("timeframe", "5m")
+
+    while True:
+        try:
+            equity = await asyncio.to_thread(exchange.get_balance)
+            start = _state.get("equity_start") or 0.0
+            dd_pct = 0.0 if start in (None, 0) else (equity - start)/start*100.0
+
+            # posições atuais da exchange (fonte da verdade)
+            pos_map = await asyncio.to_thread(exchange.fetch_positions_map)
+            open_lines = []
+            total_unreal = 0.0
+            for sym, p in pos_map.items():
+                size = float(p.get("size") or 0.0)
+                if size <= 0:
+                    continue
+                side = str(p.get("side") or ("long" if size > 0 else "short")).lower()
+                entry = float(p.get("entryPrice") or 0.0)
+                last = await asyncio.to_thread(exchange.get_last_price, sym) or entry
+                upnl = ((last - entry) if side == "long" else (entry - last)) * size
+                total_unreal += upnl
+                st = _state.get("open_positions_info", {}).get(sym, {})
+                sl = st.get("stop")
+                next_tp = None
+                tps = st.get("tp_targets") or []
+                if tps:
+                    next_tp = float(tps[0])
+                open_lines.append(
+                    f"  • {sym} [{side.upper()}] qty={size:.6g} | entry={entry:.6g} | last={last:.6g} | uPnL≈{upnl:.2f} | SL={sl if sl else '—'} | TP1={next_tp if next_tp else '—'}"
+                )
+
+            d = _state["daily"]
+            head = (
+                f"💓 <b>Status</b> | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+                f"Equity: {equity:.2f} USDT | ΔDia: {dd_pct:.2f}% | uPnL≈ {total_unreal:.2f}\n"
+                f"Trades: {d['trades']} (W {d['wins']}/L {d['losses']}/SeqL {d['consecutive_losses']}) | "
+                f"Circuito: {'PAUSADO' if _state['circuit_paused'] else 'ATIVO'}\n"
+                f"Pares monitorados: {len(cfg.get('trade',{}).get('pairs', []))} | TF: {timeframe}\n"
+            )
+            body = "\n".join(open_lines) if open_lines else "  • Sem posições abertas no momento."
+            try:
+                await telegram.send_message(head + body)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"heartbeat erro: {e}")
+            try:
+                await telegram.send_message(f"⚠️ Heartbeat erro: {e}")
+            except Exception:
+                pass
+
+        await asyncio.sleep(max(60, interval_min * 60))
+
+# -------- canal de comandos do dashboard --------
+async def control_loop(exchange: Exchange, telegram: TelegramBot, logger: Logger):
+    os.makedirs(CONTROLS_DIR, exist_ok=True)
+    while True:
+        try:
+            for name in sorted(os.listdir(CONTROLS_DIR)):
+                if not name.lower().endswith(".json"): continue
+                path = os.path.join(CONTROLS_DIR, name)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        cmd = json.load(f)
+                except Exception:
+                    continue
+                ctype = str(cmd.get("type") or "").lower()
+                if ctype == "close_position":
+                    symbol = cmd.get("symbol")
+                    if symbol:
+                        await telegram.send_message(f"🟠 Solicitação de <b>fechamento manual</b> recebida: {symbol}")
+                        res = await asyncio.to_thread(exchange.close_position, symbol)
+                        await telegram.send_message(
+                            f"🔻 Close {symbol}: status={res.get('status')} order_id={res.get('id') or '—'}"
+                        )
+                        logger.info(f"[CTRL] close_position {symbol} -> {res}")
+                try: os.remove(path)
+                except Exception: pass
+        except Exception as e:
+            logger.warning(f"control_loop erro: {e}")
+        await asyncio.sleep(2)
+
+# --- DEBUG SCAN LOOP (versão descritiva) ---
+async def debug_scan_loop(telegram, exchange, strategy, risk_manager, cfg):
+    import math
+    from datetime import datetime, timezone
+
+    def _human_reason(code: str) -> str:
+        m = {
+            "trend_misaligned": "tendência desalinhada (EMA50 vs EMA200).",
+            "no_squeeze": "sem compressão (largura BB acima do percentil alvo).",
+            "no_breakout_long": "sem rompimento p/ cima (Donchian/Bollinger).",
+            "no_breakout_short": "sem rompimento p/ baixo (Donchian/Bollinger).",
+            "no_impulse": "falta impulso (ADX baixo e corpo < limiar).",
+            "entry_stop_invalid": "entry/stop inválidos p/ sizing.",
+            "calc_error": "erro de cálculo de indicadores.",
+            "ok": "ok",
+            None: "sem sinal",
+            "": "sem sinal",
+        }
+        return m.get(code, code or "sem sinal")
+
+    def _chunk_and_send(text: str):
+        # Telegram ~4096 chars por mensagem; usamos 3500 p/ margem
+        CH = 3500
+        parts = [text[i:i+CH] for i in range(0, len(text), CH)] or [text]
+        return parts
+
+    dbg = cfg.get("debug", {}) or {}
+    if not dbg.get("enabled", False):
+        return
+
+    interval_min = int(dbg.get("scan_report_minutes", 5))
+    pairs = cfg.get("trade", {}).get("pairs", [])
+    pairs = pairs[: int(dbg.get("pairs_limit", 8))]
+    timeframe = cfg.get("trade", {}).get("timeframe", "5m")
+
+    # limites da estratégia atual (p/ explicar impulso)
+    tcfg = cfg.get("trade", {}) or {}
+    adx_min = float(tcfg.get("adx_min", 18.0))
+    impulse_body_atr_mult = float(tcfg.get("impulse_body_atr_mult", 0.4))
+    tp1_r_mult = float(tcfg.get("tp1_r_mult", 2.0))
+
+    while True:
+        try:
+            equity = await asyncio.to_thread(exchange.get_balance)
+            lines = []
+            lines.append(
+                f"🧭 <b>Diagnóstico de varredura</b>\n"
+                f"Equity≈ {equity:.2f} USDT | timeframe {timeframe} | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+            )
+
+            for sym in pairs:
+                candles = await asyncio.to_thread(exchange.get_ohlcv, sym, timeframe, 220)
+                if candles is None or len(candles) < 60:
+                    lines.append(f"• <b>{sym}</b>: sem candles suficientes (tem {0 if candles is None else len(candles)})")
+                    continue
+
+                # métricas base
+                try:
+                    price = float(candles["close"].iloc[-1])
+                    open_ = float(candles["open"].iloc[-1])
+                except Exception:
+                    lines.append(f"• <b>{sym}</b>: erro lendo preço/abertura.")
+                    continue
+
+                dx = strategy.explain_signal(candles) or {}
+                bias = dx.get("bias", "neutral")
+                atr_val = float(dx.get("atr") or 0.0)
+                atr_pct = float(dx.get("atr_pct") or (atr_val / price if price else 0.0))
+                adx_val = float(dx.get("adx") or 0.0)
+                rsi_val = float(dx.get("rsi") or 50.0)
+                don_hi = dx.get("don_high")
+                don_lo = dx.get("don_low")
+                squeeze_w = float(dx.get("squeeze_w") or 0.0)
+                squeeze_pctl = float(dx.get("squeeze_pctl") or squeeze_w)
+                squeeze_on = (squeeze_w <= squeeze_pctl) if (squeeze_w and squeeze_pctl) else False
+
+                # impulso (ADX ou corpo em ATR)
+                body = abs(price - open_)
+                body_in_atr = (body / atr_val) if atr_val > 0 else 0.0
+                impulse_ok = (adx_val >= adx_min) or (body_in_atr >= impulse_body_atr_mult)
+
+                # rompimento (usando Donchian da explicação)
+                breakout_long = (price > float(don_hi)) if don_hi is not None else False
+                breakout_short = (price < float(don_lo)) if don_lo is not None else False
+
+                sig = dx.get("signal")
+                if sig:
+                    entry = float(dx.get("entry") or price)
+                    stop = float(dx.get("stop") or (entry - (0.9 * atr_val) if sig == "long" else entry + (0.9 * atr_val)))
+                    R = abs(entry - stop)
+                    # diagnosticar qty com base em entry/stop atuais
+                    rm = risk_manager.diagnose_position(exchange, sym, {"entry": entry, "stop": stop}, current_equity=equity)
+                    qty = rm.get("qty", 0.0)
+                    # TP1 em R (parcial)
+                    tp1 = entry + tp1_r_mult * R if sig == "long" else entry - tp1_r_mult * R
+                    comp = (
+                        f"trend={bias.upper()} | squeeze={'ON' if squeeze_on else 'OFF'} | "
+                        f"breakout={'UP' if sig=='long' else 'DOWN'} | impulse={'ON' if impulse_ok else 'OFF'}"
+                    )
+                    lines.append(
+                        f"• <b>{sym}</b>: <b>SINAL {sig.upper()}</b>\n"
+                        f"  {comp}\n"
+                        f"  ATR%={atr_pct*100:.3f}% | ADX={adx_val:.1f} | RSI={rsi_val:.1f} | body={body_in_atr:.2f}×ATR\n"
+                        f"  Entry={entry:.6g} | Stop={stop:.6g} | R={R:.6g} | TP1={tp1:.6g}\n"
+                        f"  qty≈{qty:.6g} ({rm.get('reason','ok')})"
+                    )
+                else:
+                    reason = _human_reason(dx.get("reason"))
+                    # componente de rompimento: mostra relação com Donchian
+                    if bias == "long" and don_hi is not None:
+                        brk = f"preço {price:.6g} {'>' if breakout_long else '<='} Donchian↑ {float(don_hi):.6g}"
+                    elif bias == "short" and don_lo is not None:
+                        brk = f"preço {price:.6g} {'<' if breakout_short else '>='} Donchian↓ {float(don_lo):.6g}"
+                    else:
+                        brk = "sem direção clara p/ rompimento"
+
+                    comp = (
+                        f"trend={bias.upper()} | squeeze={'ON' if squeeze_on else 'OFF'} | "
+                        f"{brk} | impulse={'ON' if impulse_ok else 'OFF'}"
+                    )
+
+                    # sizing hipotético se houver entry/stop
+                    entry_h = dx.get("entry")
+                    stop_h = dx.get("stop")
+                    sizing_note = ""
+                    if entry_h and stop_h:
+                        rm = risk_manager.diagnose_position(exchange, sym, {"entry": entry_h, "stop": stop_h}, current_equity=equity)
+                        sizing_note = f" | qty_hyp≈{rm.get('qty',0.0):.6g} ({rm.get('reason','ok')})"
+
+                    lines.append(
+                        f"• <b>{sym}</b>: <i>sem sinal</i> — {reason}\n"
+                        f"  {comp}\n"
+                        f"  ATR%={atr_pct*100:.3f}% | ADX={adx_val:.1f} | RSI={rsi_val:.1f} | body={body_in_atr:.2f}×ATR{sizing_note}"
+                    )
+
+            text = "\n".join(lines)
+            for part in _chunk_and_send(text):
+                try:
+                    await telegram.send_message(part)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            try:
+                await telegram.send_message(f"⚠️ Debug scan error (verbose): {e}")
+            except Exception:
+                pass
+
+        await asyncio.sleep(max(60, interval_min * 60))
+
+
+# ----------------- MAIN -----------------
+
+async def main():
+    cfg = load_config()
+    logger = Logger()
+
+    load_runtime_state_from_disk()
+    validate_config(cfg, logger)
+
+    pairs = cfg["trade"]["pairs"]
+    timeframe = cfg["trade"]["timeframe"]
+    status_minutes = int(cfg.get("telegram", {}).get("status_interval_minutes", 5))
+    daily_loss_limit_pct = float(cfg["trade"].get("daily_loss_limit_pct", 10.0))
+    max_open_positions = int(cfg["trade"].get("max_open_positions", 3))
+    max_trades_per_day = int(cfg["trade"].get("max_trades_per_day", 999))
+    max_consec_losses = int(cfg["trade"].get("max_consecutive_losses", 999))
+    runtime_persist_seconds = int(cfg["trade"].get("runtime_persist_seconds", 30))
+
+    loop = asyncio.get_running_loop()
+    telegram = TelegramBot(
+        token=cfg["telegram"]["token"], chat_id=cfg["telegram"]["chat_id"],
+        logger=logger, pairs_provider=lambda: pairs
+    )
+
+    # Conexão
+    try:
+        exchange = Exchange(cfg, logger)
+    except Exception as e:
+        try: await telegram.send_message(f"🛑 Falha crítica ao conectar Bybit: {e}\nEncerrando o bot.")
+        except Exception: pass
+        raise
+
+    strategy = Strategy(cfg, logger)
+    risk_manager = RiskManager(cfg, logger)
+
+    await telegram.send_message("🤖 Bot iniciado! Iniciando análise e proteções…")
+
+    # substitui start_periodic_status por heartbeat rico (nosso loop)
+    asyncio.create_task(status_heartbeat_loop(telegram, exchange, strategy, cfg, logger))
+    asyncio.create_task(runtime_persist_loop(runtime_persist_seconds))
+    asyncio.create_task(control_loop(exchange, telegram, logger))
+    asyncio.create_task(debug_scan_loop(telegram, exchange, strategy, risk_manager, cfg))
+
+    rehydrate_runtime_state(exchange, logger)
+
+    equity_now = await asyncio.to_thread(exchange.get_balance)
+    if _state.get("day") != date.today() or _state.get("equity_start") is None:
+        _reset_day(equity_now)
+    else:
+        _state["last_equity"] = equity_now
+    save_runtime_state()
+
+    def on_closed(sym: str, pnl: float, reason: str):
+        logger.info(f"[{sym}] posição encerrada ({reason}) PnL≈ {pnl:.2f}")
+        d = _state["daily"]
+        d["trades"] += 1
+        d["realized_pnl"] += float(pnl or 0.0)
+        if pnl >= 0:
+            d["wins"] += 1; d["consecutive_losses"] = 0
+        else:
+            d["losses"] += 1; d["consecutive_losses"] += 1
+        _state["open_positions_info"].pop(sym, None)
+        _state["open_symbols"].discard(sym)
+        save_runtime_state()
+
+    reconciler = Reconciler(exchange, strategy, risk_manager, logger, cfg, _state, on_position_closed=on_closed)
+    asyncio.create_task(reconciler.run())
+    asyncio.create_task(daily_report_loop(telegram, exchange, cfg))
+
+    while True:
+        try:
+            equity_now = await asyncio.to_thread(exchange.get_balance)
+            paused = _check_circuit_breaker(equity_now, daily_loss_limit_pct)
+            save_runtime_state()
+
+            if paused:
+                try:
+                    await telegram.send_message("🛑 Circuit breaker ativo (limite diário alcançado). Novas entradas pausadas.")
+                except Exception:
+                    pass
+
+            if in_no_trade_window(cfg["trade"]):
+                await asyncio.sleep(10); continue
+
+            d = _state["daily"]
+            if d["trades"] >= max_trades_per_day or d["consecutive_losses"] >= max_consec_losses:
+                _state["circuit_paused"] = True; save_runtime_state()
+
+            pos_map = await asyncio.to_thread(exchange.fetch_positions_map)
+            current_open_on_exchange = {sym for sym, info in pos_map.items() if float(info.get("size") or 0.0) > 0}
+
+            for pair in pairs:
+                if _state["circuit_paused"]: continue
+                if len(_state["open_symbols"]) >= max_open_positions: continue
+                if pair in current_open_on_exchange or pair in _state["open_symbols"]: continue
+
+                candles = await asyncio.to_thread(exchange.get_ohlcv, pair, timeframe, 300)
+                if candles is None or len(candles) < 50: continue
+
+                signal = strategy.generate_signal(candles)
+                if not signal: continue
+
+                qty, stop_loss, tp_single = risk_manager.calculate_position(exchange, pair, signal, current_equity=equity_now)
+                if qty <= 0:
+                    logger.info(f"[{pair}] sinal ignorado: qty <= 0"); continue
+
+                direction = "buy" if signal["signal"] == "long" else "sell"
+                entry = float(signal["entry"])
+                atr_val = float(signal.get("info", {}).get("atr") or 0.0)
+
+                # plano de parciais: TP1 (50%) em 2R — trailing fica no reconciler
+                tp_plan = risk_manager.build_tp_plan("long" if direction=="buy" else "short", entry, atr_val, qty, stop=stop_loss)
+                if not tp_plan and tp_single:
+                    tp_plan = [{"price": tp_single, "qty": qty}]
+
+                start_equity = float(_state.get("equity_start") or 0.0)
+                dd_pct = 0.0 if start_equity <= 0 else (equity_now - start_equity) / start_equity * 100.0
+                await telegram.send_message(
+                    "⚡ <b>Sinal</b>\n"
+                    f"Par: {pair}\nDireção: {signal['signal'].upper()}\n"
+                    f"Entry: {entry}\nSL: {stop_loss}\nTP_plan: {tp_plan}\nQty: {qty}\nΔDia: {dd_pct:.2f}%"
+                )
+
+                order = await asyncio.to_thread(exchange.execute_order, pair, direction, qty, stop_loss, tp_single, tp_plan)
+                order_id = order.get("id") if isinstance(order, dict) else ""
+                status = order.get("status") if isinstance(order, dict) else "created"
+
+                _state["open_symbols"].add(pair)
+                tp_targets = [float(t.get("price")) for t in (tp_plan or []) if t.get("price")]
+                if not tp_targets and tp_single:
+                    tp_targets = [float(tp_single)]
+                _state["open_positions_info"][pair] = {
+                    "qty": qty, "entry": entry, "side": "long" if direction=="buy" else "short",
+                    "stop": float(stop_loss) if stop_loss else None, "tp_targets": tp_targets,
+                    "be_done": False, "hw": None, "lw": None,
+                }
+                save_runtime_state()
+
+                rec = {"symbol": pair, "side": direction.upper(), "qty": qty, "entry": entry, "stop": stop_loss,
+                       "tp": tp_single, "order_id": order_id, "status": status}
+                save_trade_to_json(rec); append_trade_csv(rec)
+
+                await telegram.send_message(
+                    "📈 <b>Entrada</b>\n"
+                    f"Par: {pair}\nDireção: {direction.upper()}\nQty: {qty}\nEntry: {entry}\nSL: {stop_loss}\nTPs: {tp_plan}\nOrderID: {order_id or '—'}"
+                )
+
+            await asyncio.sleep(20)
+
+        except Exception as e:
+            err = f"❌ Erro no loop principal: {str(e)}"
+            logger.exception(err)
+            try: await telegram.send_message(err)
+            except Exception: pass
+            await asyncio.sleep(5)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
