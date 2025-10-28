@@ -1,0 +1,77 @@
+# config/config.yaml
+exchange:
+  name: bybit
+  testnet: true              # true = Testnet | false = conta real
+  paper: true                # true = "paper trading" (não envia ordens reais)
+  leverage: 2                # alavancagem conservadora (pode ajustar)
+  margin_mode: CROSS         # CROSS (você pediu margem cruzada)
+
+# === SUAS CREDENCIAIS (substitua) ===
+api_key: "<SUA_API_KEY_BYBIT>"
+api_secret: "<SUA_API_SECRET_BYBIT>"
+
+trade:
+  # ===== Timeframe & Pares =====
+  timeframe: "5m"
+  pairs:
+    - "BTC/USDT:USDT"
+    - "ETH/USDT:USDT"
+  # Pode adicionar mais pares depois que estiver tudo ok:
+  #  - "SOL/USDT:USDT"
+  #  - "BNB/USDT:USDT"
+
+  # ===== Estratégia =====
+  signal_mode: "atr_breakout_vwap"   # novo modo
+  n_channel: 30                      # janela do canal (Donchian) p/ breakout
+  k_atr: 0.75                        # “almofada” do canal: k*ATR
+  adx_min: 18                        # filtro de regime (>= mantém tendência)
+  min_atr_pct: 0.008                 # 0.8% de ATR/price (filtro de volatilidade)
+  # Desliga alinhamento por minutos:
+  align_to_quarter_hour: false
+  # (opção mais flexível — se quiser usar no futuro)
+  # entry_alignment: "none"          # "none" | "quarter" | "custom"
+  # entry_minutes: [0, 15, 30, 45]   # usado se entry_alignment="custom"
+
+  # Confirmação extra para reduzir ruído
+  signal_confirm_bars: 2             # 1–2 (2 = mais seletivo)
+  vwap_slope_window: 8               # para detectar inclinação da VWAP
+
+  # ===== Risco/SL/TP/Parciais =====
+  risk_per_trade: 1.5                # % do equity por trade (recomendado iniciar baixo)
+  max_notional_pct: 0.30             # cap de exposição bruta p/ não “capar” sempre o risco
+  atr_mult_sl: 1.0                   # SL = 1.0x ATR
+  atr_mult_tp: 1.6                   # TP = 1.6x ATR (R≈1.6)
+  partials_enabled: true
+  tp1_multiplier: 1.0                # parcial em 1.0R
+  tp2_multiplier: 1.6
+  tp1_qty_pct: 50.0                  # % da posição que realiza na parcial
+
+  # ===== Proteções =====
+  daily_loss_limit_pct: 10           # circuito diário (para testes)
+  max_open_positions: 1              # começa com 1; depois pode subir para 2
+  max_trades_per_day: 999
+  max_consecutive_losses: 999
+  cooldown_seconds: 180              # evita flip imediato no mesmo par
+  runtime_persist_seconds: 30        # frequência de persistência do estado
+
+  # (Opcional) fallback se mercado reportar ATR≈0 (geralmente não precisa no 5m):
+  atr_zero_fallback_pct: 0.0
+
+telegram:
+  token: "<SEU_TELEGRAM_BOT_TOKEN>"
+  chat_id: "<SEU_CHAT_ID>"
+  status_interval_minutes: 5         # heartbeat/status a cada 5 min
+
+report:
+  daily_report_utc: "23:59"          # relatório diário
+
+# === Fonte de candles ===
+market_data:
+  source: "live"                     # usa OHLCV público; execução continua na sua conta/testnet
+
+# === Debug/Diagnóstico (mensagem no Telegram) ===
+debug:
+  enabled: true
+  scan_report_minutes: 5
+  pairs_limit: 8
+  send_only_when_no_trades: false
